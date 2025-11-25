@@ -1,13 +1,14 @@
 use bevy::{
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
-    post_process::bloom::{Bloom, BloomCompositeMode},
+    post_process::bloom::Bloom,
     prelude::*,
 };
+use bevy::audio::{AudioPlayer, PlaybackSettings};
 use symphonia::{core::audio::AudioBufferRef, default};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::audio::{AudioBuffer, Signal};
+use symphonia::core::audio::Signal;
 use symphonia::core::codecs::DecoderOptions;
-use rustfft::{FftPlanner, num_complex::Complex};
+use symphonia::core::io::MediaSourceStream;
+use rustfft::{num_complex::Complex, FftPlanner};
 
 #[derive(Component)]
 pub struct VisualizerBar;
@@ -18,14 +19,14 @@ pub struct BandRange(pub f32, pub f32);
 #[derive(Component, Default)]
 pub struct BarValue(pub f32);
 
-
-
 #[derive(Resource)]
 pub struct AudioData {
     pub samples: Vec<f32>,
     pub position: usize,
     pub fft: Vec<f32>,
     pub fft_size: usize,
+    pub sample_rate: f32,
+    pub level: f32, // smoothed music intensity 0..~1+
 }
 
 impl Default for AudioData {
@@ -35,10 +36,11 @@ impl Default for AudioData {
             position: 0,
             fft: vec![],
             fft_size: 2048,
+            sample_rate: 44100.0,
+            level: 0.0,
         }
     }
 }
-
 
 pub const BANDS: [(f32, f32); 10] = [
     (20.0, 31.0),
@@ -53,30 +55,37 @@ pub const BANDS: [(f32, f32); 10] = [
     (8000.0, 16000.0),
 ];
 
-
-
-
-
-
 fn main() {
     App::new()
-    .add_plugins(DefaultPlugins)
-    .init_resource::<AudioData>()
-    .add_systems(Startup, setup)
-    .add_systems(Update, update_bloom_settings)
-    .add_systems(Update, add_bars)
-    .add_systems(Startup, load_audio)
-    .add_systems(Update, process_audio)
-    .add_systems(Update, hello_world)
-    .run();
+        .add_plugins(DefaultPlugins)
+        .init_resource::<AudioData>()
+        .add_systems(Startup, (setup, load_audio, start_music))
+        .add_systems(
+            Update,
+            (
+                process_audio,
+                update_bloom_settings, // uses audio + input
+                add_bars,
+                hello_world,
+            ),
+        )
+        .run();
 }
 
+fn start_music(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let audio = asset_server.load("track.ogg");
+
+    commands.spawn((
+        AudioPlayer::new(audio),
+        PlaybackSettings::LOOP, // or PlaybackSettings::ONCE
+    ));
+}
 
 fn hello_world() {
-    println!("hello world!");
+    println!("i like blowjobs");
 }
 
-fn process_audio(mut audio: ResMut<AudioData>) {
+fn process_audio(mut audio: ResMut<AudioData>, time: Res<Time>) {
     if audio.samples.is_empty() {
         return;
     }
@@ -88,15 +97,43 @@ fn process_audio(mut audio: ResMut<AudioData>) {
     }
 
     let window = audio.samples[audio.position..audio.position + fft_size].to_vec();
-    audio.position += 512;
+    audio.position += 512; // hop size
 
-    let mut buffer: Vec<Complex<f32>> = window.into_iter().map(|x| Complex::new(x, 0.0)).collect();
+    let mut buffer: Vec<Complex<f32>> = window
+        .into_iter()
+        .map(|x| Complex::new(x, 0.0))
+        .collect();
 
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
     fft.process(&mut buffer);
 
     audio.fft = buffer.iter().map(|c| c.norm()).collect();
+
+    // Compute a basic "level" from FFT
+    let sample_rate = audio.sample_rate;
+    let bin_hz = sample_rate / fft_size as f32;
+
+    let min_hz = 20.0;
+    let max_hz = 8000.0;
+
+    let start_bin = (min_hz / bin_hz).max(0.0) as usize;
+    let end_bin = (max_hz / bin_hz).min(audio.fft.len().saturating_sub(1) as f32) as usize;
+
+    if end_bin > start_bin {
+        let slice = &audio.fft[start_bin..=end_bin];
+        let energy = slice.iter().sum::<f32>() / (slice.len() as f32);
+
+        // compression & smoothing
+        let raw_level = (energy / 10.0).sqrt();
+        let target = raw_level.clamp(0.0, 5.0);
+
+        let smooth = 10.0;
+        let dt = time.delta_secs();
+        let alpha = (1.0 - (-smooth * dt).exp()).clamp(0.0, 1.0);
+
+        audio.level = audio.level * (1.0 - alpha) + target * alpha;
+    }
 }
 
 fn load_audio(mut audio: ResMut<AudioData>) {
@@ -112,6 +149,10 @@ fn load_audio(mut audio: ResMut<AudioData>) {
     let mut format = probed.format;
     let track = format.default_track().unwrap();
 
+    // get sample rate if present
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100) as f32;
+    audio.sample_rate = sample_rate;
+
     let mut decoder = default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .unwrap();
@@ -123,7 +164,6 @@ fn load_audio(mut audio: ResMut<AudioData>) {
 
         match decoded {
             AudioBufferRef::F32(buf) => {
-                // `chan` comes from the `Signal` trait – imported above
                 pcm.extend_from_slice(buf.chan(0));
             }
             _ => panic!("Only f32 PCM supported"),
@@ -134,12 +174,11 @@ fn load_audio(mut audio: ResMut<AudioData>) {
     audio.samples = pcm;
 }
 
-
 fn add_bars(mut commands: Commands) {
-    let spacing = 40.0;
-    let bar_width = 30.0;
+    let _spacing = 40.0;
+    let _bar_width = 30.0;
 
-    for (i, (min, max)) in BANDS.iter().enumerate() {
+    for (_i, (min, max)) in BANDS.iter().enumerate() {
         commands.spawn((
             VisualizerBar,
             BandRange(*min, *max),
@@ -148,16 +187,11 @@ fn add_bars(mut commands: Commands) {
     }
 }
 
-fn process_bars(query: Query<(&BandRange, &BarValue), With<VisualizerBar>>) {
-    for (range, value) in &query {
-        println!(
-            "Bar {:?}-{:?} has value {:?}",
-            range.0, range.1, value.0
-        );
-    }
-}
-
-
+// fn process_bars(query: Query<(&BandRange, &BarValue), With<VisualizerBar>>) {
+//     for (range, value) in &query {
+//         println!("Bar {:?}-{:?} has value {:?}", range.0, range.1, value.0);
+//     }
+// }
 
 fn setup(
     mut commands: Commands,
@@ -165,102 +199,54 @@ fn setup(
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
+    // 2D camera with bloom
     commands.spawn((
         Camera2d,
         Camera {
             clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
-        Tonemapping::TonyMcMapface, // 1. Using a tonemapper that desaturates to white is recommended
-        Bloom::default(),           // 2. Enable bloom for the camera
-        DebandDither::Enabled,      // Optional: bloom causes gradients which cause banding
+        Tonemapping::TonyMcMapface,
+        Bloom::default(),
+        DebandDither::Enabled,
     ));
 
-    // Sprite
+    // Bright sprite
     commands.spawn(Sprite {
         image: asset_server.load("branding/bevy_bird_dark.png"),
-        color: Color::srgb(5.0, 5.0, 5.0), // 3. Put something bright in a dark environment to see the effect
+        color: Color::srgb(5.0, 5.0, 5.0),
         custom_size: Some(Vec2::splat(160.0)),
         ..default()
     });
 
-    // Circle mesh
+    // Circle mesh in center, slightly behind
     commands.spawn((
         Mesh2d(meshes.add(Circle::new(100.))),
-        // 3. Put something bright in a dark environment to see the effect
         MeshMaterial2d(materials.add(Color::srgb(7.5, 0.0, 7.5))),
-        Transform::from_translation(Vec3::new(-200., 0., 0.)),
+        Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
     ));
 
-    // Hexagon mesh
+    // Hexagon mesh in same spot, slightly in front
     commands.spawn((
         Mesh2d(meshes.add(RegularPolygon::new(100., 6))),
-        // 3. Put something bright in a dark environment to see the effect
         MeshMaterial2d(materials.add(Color::srgb(6.25, 9.4, 9.1))),
-        Transform::from_translation(Vec3::new(200., 0., 0.)),
-    ));
-
-    // UI
-    commands.spawn((
-        Text::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(12),
-            left: px(12),
-            ..default()
-        },
+        Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
     ));
 }
 
-
 fn update_bloom_settings(
     camera: Single<(Entity, &Tonemapping, Option<&mut Bloom>), With<Camera>>,
-    mut text: Single<&mut Text>,
     mut commands: Commands,
     keycode: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    audio: Res<AudioData>,
 ) {
     let (camera_entity, tonemapping, bloom) = camera.into_inner();
+    let dt = time.delta_secs();
 
     match bloom {
         Some(mut bloom) => {
-            text.0 = "Bloom (Toggle: Space)\n".to_string();
-            text.push_str(&format!("(Q/A) Intensity: {:.2}\n", bloom.intensity));
-            text.push_str(&format!(
-                "(W/S) Low-frequency boost: {:.2}\n",
-                bloom.low_frequency_boost
-            ));
-            text.push_str(&format!(
-                "(E/D) Low-frequency boost curvature: {:.2}\n",
-                bloom.low_frequency_boost_curvature
-            ));
-            text.push_str(&format!(
-                "(R/F) High-pass frequency: {:.2}\n",
-                bloom.high_pass_frequency
-            ));
-            text.push_str(&format!(
-                "(T/G) Mode: {}\n",
-                match bloom.composite_mode {
-                    BloomCompositeMode::EnergyConserving => "Energy-conserving",
-                    BloomCompositeMode::Additive => "Additive",
-                }
-            ));
-            text.push_str(&format!(
-                "(Y/H) Threshold: {:.2}\n",
-                bloom.prefilter.threshold
-            ));
-            text.push_str(&format!(
-                "(U/J) Threshold softness: {:.2}\n",
-                bloom.prefilter.threshold_softness
-            ));
-            text.push_str(&format!("(I/K) Horizontal Scale: {:.2}\n", bloom.scale.x));
-
-            if keycode.just_pressed(KeyCode::Space) {
-                commands.entity(camera_entity).remove::<Bloom>();
-            }
-
-            let dt = time.delta_secs();
-
+            // manual keyboard-driven intensity
             if keycode.pressed(KeyCode::KeyA) {
                 bloom.intensity -= dt / 10.0;
             }
@@ -269,81 +255,32 @@ fn update_bloom_settings(
             }
             bloom.intensity = bloom.intensity.clamp(0.0, 1.0);
 
-            if keycode.pressed(KeyCode::KeyS) {
-                bloom.low_frequency_boost -= dt / 10.0;
-            }
-            if keycode.pressed(KeyCode::KeyW) {
-                bloom.low_frequency_boost += dt / 10.0;
-            }
-            bloom.low_frequency_boost = bloom.low_frequency_boost.clamp(0.0, 1.0);
-
-            if keycode.pressed(KeyCode::KeyD) {
-                bloom.low_frequency_boost_curvature -= dt / 10.0;
-            }
-            if keycode.pressed(KeyCode::KeyE) {
-                bloom.low_frequency_boost_curvature += dt / 10.0;
-            }
-            bloom.low_frequency_boost_curvature =
-                bloom.low_frequency_boost_curvature.clamp(0.0, 1.0);
-
-            if keycode.pressed(KeyCode::KeyF) {
-                bloom.high_pass_frequency -= dt / 10.0;
-            }
-            if keycode.pressed(KeyCode::KeyR) {
-                bloom.high_pass_frequency += dt / 10.0;
-            }
-            bloom.high_pass_frequency = bloom.high_pass_frequency.clamp(0.0, 1.0);
-
-            if keycode.pressed(KeyCode::KeyG) {
-                bloom.composite_mode = BloomCompositeMode::Additive;
-            }
-            if keycode.pressed(KeyCode::KeyT) {
-                bloom.composite_mode = BloomCompositeMode::EnergyConserving;
-            }
-
-            if keycode.pressed(KeyCode::KeyH) {
-                bloom.prefilter.threshold -= dt;
-            }
-            if keycode.pressed(KeyCode::KeyY) {
-                bloom.prefilter.threshold += dt;
-            }
-            bloom.prefilter.threshold = bloom.prefilter.threshold.max(0.0);
-
-            if keycode.pressed(KeyCode::KeyJ) {
-                bloom.prefilter.threshold_softness -= dt / 10.0;
-            }
-            if keycode.pressed(KeyCode::KeyU) {
-                bloom.prefilter.threshold_softness += dt / 10.0;
-            }
-            bloom.prefilter.threshold_softness = bloom.prefilter.threshold_softness.clamp(0.0, 1.0);
-
-            if keycode.pressed(KeyCode::KeyK) {
-                bloom.scale.x -= dt * 2.0;
-            }
-            if keycode.pressed(KeyCode::KeyI) {
-                bloom.scale.x += dt * 2.0;
-            }
-            bloom.scale.x = bloom.scale.x.clamp(0.0, 16.0);
-        }
-
-        None => {
-            text.0 = "Bloom: Off (Toggle: Space)\n".to_string();
+            // music modulation
+            let music_level = (audio.level * 0.3).min(1.0);
+            let base = bloom.intensity;
+            let music_mix = 0.6;
+            bloom.intensity = (1.0 - music_mix) * base + music_mix * music_level;
 
             if keycode.just_pressed(KeyCode::Space) {
+                println!("Toggling bloom OFF");
+                commands.entity(camera_entity).remove::<Bloom>();
+            }
+        }
+        None => {
+            if keycode.just_pressed(KeyCode::Space) {
+                println!("Toggling bloom ON");
                 commands.entity(camera_entity).insert(Bloom::default());
             }
         }
     }
 
-    text.push_str(&format!("(O) Tonemapping: {tonemapping:?}\n"));
     if keycode.just_pressed(KeyCode::KeyO) {
+        println!("Cycling tonemapper: {tonemapping:?}");
         commands
             .entity(camera_entity)
             .insert(next_tonemap(tonemapping));
     }
 }
-
-
 
 fn next_tonemap(tonemapping: &Tonemapping) -> Tonemapping {
     match tonemapping {
